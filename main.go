@@ -1,0 +1,402 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+)
+
+const systemPromptMD = `You are a technical architect and lead software engineer.
+Your task is to produce a detailed PROMPT.md file for another AI agent (Claude Code),
+which will implement the task.
+
+PROMPT.md must not be a generic task description; it must be an actionable instruction set for Claude Code.
+It must explicitly require the following workflow:
+
+1. Before any code changes, read all relevant markdown instructions and project reference files.
+2. Mandatory starting files: AGENTS.md, MEMORY.md, CLAUDE.md, and md_files/maintain/INFO.md.
+3. If working inside a subproject, also read local AGENTS.md, CLAUDE.md, and other relevant .md files in affected directories.
+4. Only after reading documentation, move to questions, analysis, and implementation.
+5. All ask_codex calls after the current generate_prompt_md must stay within one shared Codex-bridge session.
+6. Ask questions through ask_codex strictly sequentially: one question per call, only after receiving the previous answer, with no parallel calls.
+7. After implementation, run all relevant tests and checks for the affected part of the project.
+8. If tests were not run, failed, or ended with errors, the task is not complete.
+9. Before final completion, call the fill_md_files tool and update key markdown files based on completed work.
+10. After task completion, rename the current PROMPT.md by appending date and time in YYYY-MM-DD_HH-mm-ss format and move it to md_files/prompts/old.
+11. If md_files/prompts/old does not exist, create this directory first.
+
+PROMPT.md must include:
+
+1. Short task description (1-2 paragraphs)
+2. Goals and expected outcome
+3. Mandatory preparation checklist before implementation
+4. Technical stack and constraints
+5. File/package structure (if applicable)
+6. Key implementation requirements
+7. Clarifying questions that must be answered before coding
+8. Input/output examples (if applicable)
+9. What NOT to do (anti-patterns, constraints)
+10. Mandatory checks and tests before task completion
+11. Final post-completion actions, including fill_md_files and PROMPT.md archival
+
+Return only the PROMPT.md content with no extra text.
+Use Markdown formatting.
+Write concrete instructions and checklists so Claude Code can execute them without guessing.`
+
+const systemPromptQA = `You are a technical expert and lead software engineer.
+You help another AI agent (Claude Code) gather all required implementation details.
+Answer questions precisely, concretely, and directly.
+If a question is ambiguous, provide the most reasonable option and explain your choice.`
+
+const systemPromptFillMDFiles = `You are a technical writer and lead software engineer.
+Your task is to update project markdown files based on already completed Claude Code work.
+
+Input you receive:
+1. Final implementation result
+2. List of markdown files and their current contents
+
+Return only a JSON object without markdown wrappers and without explanations in this format:
+{
+  "files": [
+    {
+      "path": "relative/path/to/file.md",
+      "content": "full new file content"
+    }
+  ]
+}
+
+Rules:
+1. Return full updated text for each provided file.
+2. Preserve each file's structure and intent.
+3. Update only what is actually implied by the final implementation result.
+4. Do not invent facts not present in the input.
+5. For MEMORY.md, record short stable conclusions and operational notes.
+6. For INFO.md, record detailed technical behavior and current implementation details.
+7. For AGENTS.md and CLAUDE.md, update only instructions and workflow rules if the final result truly changes them.
+8. Do not add extra files that were not requested.
+9. The JSON must be valid.`
+
+type mdFileUpdate struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+type mdFilesResponse struct {
+	Files []mdFileUpdate `json:"files"`
+}
+
+type chatClient interface {
+	chat(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+	ask(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+	resetAskSession()
+}
+
+func promptDir() string {
+	if d := os.Getenv("PROMPT_DIR"); d != "" {
+		return d
+	}
+	dir, _ := os.Getwd()
+	return dir
+}
+
+func ensurePromptDir() (string, error) {
+	dir := strings.TrimSpace(promptDir())
+	if dir == "" {
+		return "", fmt.Errorf("PROMPT_DIR resolved to empty path")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create prompt dir: %w", err)
+	}
+	return dir, nil
+}
+
+func defaultMDFilesTargets() []string {
+	return []string{
+		"MEMORY.md",
+		"md_files/maintain/INFO.md",
+		"CLAUDE.md",
+		"AGENTS.md",
+	}
+}
+
+func parseTargets(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return defaultMDFilesTargets()
+	}
+
+	seen := map[string]struct{}{}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		target := filepath.ToSlash(strings.TrimSpace(part))
+		if target == "" {
+			continue
+		}
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		out = append(out, target)
+	}
+	if len(out) == 0 {
+		return defaultMDFilesTargets()
+	}
+	slices.Sort(out)
+	return out
+}
+
+func loadMDFilesForPrompt(targets []string) (string, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get working directory: %w", err)
+	}
+
+	var sections []string
+	for _, target := range targets {
+		clean := filepath.Clean(filepath.FromSlash(target))
+		if filepath.IsAbs(clean) {
+			return "", fmt.Errorf("absolute paths are not allowed: %s", target)
+		}
+		absPath := filepath.Join(root, clean)
+		relPath, err := filepath.Rel(root, absPath)
+		if err != nil {
+			return "", fmt.Errorf("resolve path %s: %w", target, err)
+		}
+		relPath = filepath.ToSlash(relPath)
+		if strings.HasPrefix(relPath, "../") || relPath == ".." {
+			return "", fmt.Errorf("path escapes repository root: %s", target)
+		}
+
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", relPath, err)
+		}
+
+		sections = append(sections, fmt.Sprintf("FILE: %s\n<<<CONTENT\n%s\nCONTENT>>>", relPath, string(data)))
+	}
+
+	return strings.Join(sections, "\n\n"), nil
+}
+
+func extractJSONObject(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	trimmed = strings.TrimPrefix(trimmed, "```json")
+	trimmed = strings.TrimPrefix(trimmed, "```")
+	trimmed = strings.TrimSuffix(trimmed, "```")
+	return strings.TrimSpace(trimmed)
+}
+
+func main() {
+	codex, err := newChatClient()
+	if err != nil {
+		slog.Error("chat client init failed", "err", err)
+		os.Exit(1)
+	}
+	var askMu sync.Mutex
+
+	s := server.NewMCPServer("codex-bridge", "1.0.0",
+		server.WithToolCapabilities(false),
+	)
+
+	// ─── Tool 1: generate_prompt_md ──────────────────────────────────────────
+	// Accepts a user task description, asks Codex to generate PROMPT.md,
+	// and writes it to disk.
+	s.AddTool(
+		mcp.NewTool("generate_prompt_md",
+			mcp.WithDescription(
+				"Sends a task description to Codex, which generates a detailed "+
+					"PROMPT.md file for Claude Code. The file is saved in the working directory. "+
+					"Returns the PROMPT.md content.",
+			),
+			mcp.WithString("task",
+				mcp.Required(),
+				mcp.Description("Free-form task description from the user"),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			task, err := req.RequireString("task")
+			if err != nil || strings.TrimSpace(task) == "" {
+				return mcp.NewToolResultError("parameter 'task' is required"), nil
+			}
+
+			slog.Info("generate_prompt_md called", "task_len", len(task))
+
+			content, err := codex.chat(ctx, systemPromptMD, task)
+			if err != nil {
+				return mcp.NewToolResultError("Codex error: " + err.Error()), nil
+			}
+
+			dir, err := ensurePromptDir()
+			if err != nil {
+				return mcp.NewToolResultError("failed to prepare directory for PROMPT.md: " + err.Error()), nil
+			}
+
+			path := filepath.Join(dir, "PROMPT.md")
+			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+				return mcp.NewToolResultError("failed to write PROMPT.md: " + err.Error()), nil
+			}
+
+			askMu.Lock()
+			codex.resetAskSession()
+			askMu.Unlock()
+
+			slog.Info("PROMPT.md written", "path", path)
+			return mcp.NewToolResultText(
+				fmt.Sprintf("PROMPT.md saved: %s\n\n---\n\n%s", path, content),
+			), nil
+		},
+	)
+
+	// ─── Tool 2: ask_codex ───────────────────────────────────────────────────
+	// Claude Code asks clarifying questions one-by-one. Codex answers.
+	s.AddTool(
+		mcp.NewTool("ask_codex",
+			mcp.WithDescription(
+				"Asks one clarifying question to Codex in the context of the current task. "+
+					"Use this tool at least 10 times, strictly one question per call, "+
+					"without parallel calls. All ask_codex calls after the latest generate_prompt_md "+
+					"must stay in one shared session. Returns Codex's answer.",
+			),
+			mcp.WithString("question",
+				mcp.Required(),
+				mcp.Description("Specific clarifying question about the task"),
+			),
+			mcp.WithString("context",
+				mcp.Description("Short context: PROMPT.md content or previously received answers (optional)"),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			question, err := req.RequireString("question")
+			if err != nil || strings.TrimSpace(question) == "" {
+				return mcp.NewToolResultError("parameter 'question' is required"), nil
+			}
+			extraCtx := req.GetString("context", "")
+
+			userMsg := question
+			if strings.TrimSpace(extraCtx) != "" {
+				userMsg = "Task context:\n" + extraCtx + "\n\nQuestion:\n" + question
+			}
+
+			slog.Info("ask_codex called", "question", question)
+			askMu.Lock()
+			defer askMu.Unlock()
+
+			answer, err := codex.ask(ctx, systemPromptQA, userMsg)
+			if err != nil {
+				return mcp.NewToolResultError("Codex error: " + err.Error()), nil
+			}
+
+			return mcp.NewToolResultText(answer), nil
+		},
+	)
+
+	// ─── Tool 3: fill_md_files ───────────────────────────────────────────────
+	// Updates key project markdown files based on the final result.
+	s.AddTool(
+		mcp.NewTool("fill_md_files",
+			mcp.WithDescription(
+				"Updates selected project markdown files based on Claude Code's final implementation result. "+
+					"Use after successful tests and before task completion.",
+			),
+			mcp.WithString("final_result",
+				mcp.Required(),
+				mcp.Description("Final Claude Code result: what was implemented, validated, and how it ended"),
+			),
+			mcp.WithString("targets",
+				mcp.Description("Optional comma-separated list of markdown files. Default: MEMORY.md, md_files/maintain/INFO.md, CLAUDE.md, AGENTS.md"),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			finalResult, err := req.RequireString("final_result")
+			if err != nil || strings.TrimSpace(finalResult) == "" {
+				return mcp.NewToolResultError("parameter 'final_result' is required"), nil
+			}
+
+			targets := parseTargets(req.GetString("targets", ""))
+			filesContext, err := loadMDFilesForPrompt(targets)
+			if err != nil {
+				return mcp.NewToolResultError("failed to prepare markdown files: " + err.Error()), nil
+			}
+
+			userMsg := "Final implementation result:\n" + finalResult + "\n\n" +
+				"Update the following markdown files:\n" + strings.Join(targets, "\n") + "\n\n" +
+				"Current file contents:\n\n" + filesContext
+
+			raw, err := codex.chat(ctx, systemPromptFillMDFiles, userMsg)
+			if err != nil {
+				return mcp.NewToolResultError("Codex error: " + err.Error()), nil
+			}
+
+			var resp mdFilesResponse
+			if err := json.Unmarshal([]byte(extractJSONObject(raw)), &resp); err != nil {
+				return mcp.NewToolResultError("failed to parse fill_md_files response: " + err.Error()), nil
+			}
+			if len(resp.Files) == 0 {
+				return mcp.NewToolResultError("fill_md_files returned no files"), nil
+			}
+
+			root, err := os.Getwd()
+			if err != nil {
+				return mcp.NewToolResultError("failed to resolve working directory: " + err.Error()), nil
+			}
+
+			allowed := map[string]struct{}{}
+			for _, target := range targets {
+				allowed[filepath.ToSlash(filepath.Clean(filepath.FromSlash(target)))] = struct{}{}
+			}
+
+			var updated []string
+			for _, file := range resp.Files {
+				rel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(file.Path))))
+				if _, ok := allowed[rel]; !ok {
+					return mcp.NewToolResultError("fill_md_files returned unexpected path: " + rel), nil
+				}
+				if strings.TrimSpace(file.Content) == "" {
+					return mcp.NewToolResultError("fill_md_files returned empty content for: " + rel), nil
+				}
+
+				abs := filepath.Join(root, filepath.FromSlash(rel))
+				if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+					return mcp.NewToolResultError("failed to prepare directory for " + rel + ": " + err.Error()), nil
+				}
+				if err := os.WriteFile(abs, []byte(file.Content), 0644); err != nil {
+					return mcp.NewToolResultError("failed to write " + rel + ": " + err.Error()), nil
+				}
+				updated = append(updated, rel)
+			}
+
+			slices.Sort(updated)
+			return mcp.NewToolResultText("Updated markdown files:\n- " + strings.Join(updated, "\n- ")), nil
+		},
+	)
+
+	slog.Info("codex-bridge MCP server starting (stdio)")
+	if err := server.ServeStdio(s); err != nil {
+		slog.Error("server error", "err", err)
+		os.Exit(1)
+	}
+}
+
+func newChatClient() (chatClient, error) {
+	switch strings.ToLower(envOr("CODEX_BACKEND", "auto")) {
+	case "auto":
+		if strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != "" {
+			return newOpenAIClient()
+		}
+		return newOpenAISignInClient()
+	case "api":
+		return newOpenAIClient()
+	case "signin":
+		return newOpenAISignInClient()
+	default:
+		return nil, fmt.Errorf("unsupported CODEX_BACKEND: %q", os.Getenv("CODEX_BACKEND"))
+	}
+}
