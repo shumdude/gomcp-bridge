@@ -1,52 +1,51 @@
 ﻿# gomcp-bridge
 
-`gomcp-bridge` - это подпроект реализующий MCP-сервер `codex-bridge`.
-Сервер предоставляет инструменты для генерации `PROMPT.md`, уточняющих вопросов к Codex и автоматического обновления ключевых markdown-файлов проекта.
+`gomcp-bridge` is a subproject in the `gobot` monorepo that implements the `codex-bridge` MCP server.
+The server provides tools for generating `PROMPT.md`, asking follow-up questions to Codex, and automatically updating key project markdown files.
 
-## Что делает сервер
+## What the Server Does
 
-Сервер поднимается по stdio и регистрирует 3 инструмента:
+The server runs over stdio and registers 3 tools:
 
-- `generate_prompt_md` - генерирует детальный `PROMPT.md` по задаче пользователя.
-- `ask_codex` - задает последовательные уточняющие вопросы в рамках одной сессии.
-- `fill_md_files` - обновляет выбранные markdown-файлы на основе финального результата работы.
+- `generate_prompt_md` - generates a detailed `PROMPT.md` from a user task.
+- `ask_codex` - asks sequential clarifying questions within one session.
+- `fill_md_files` - updates selected markdown files based on the final implementation result.
 
 ## Backends
 
-`gomcp-bridge` поддерживает два backend-режима:
+`gomcp-bridge` supports two backend modes:
 
-- OpenAI API (`openai.go`) через `/v1/chat/completions`
-- Codex CLI sign-in (`openai_singin.go`) через локальный `codex exec` и `resume --last`
+- OpenAI API (`openai.go`) via `/v1/chat/completions`
+- Codex CLI sign-in (`openai_singin.go`) via local `codex exec` and `resume --last`
 
-Выбор backend идет через `CODEX_BACKEND=auto|api|signin`.
+Backend selection is controlled by `CODEX_BACKEND=auto|api|signin`.
 
-## Быстрый старт
+## Quick Start
 
-Из корня репозитория:
+From the repository root:
 
 ```powershell
 go run ./gomcp-bridge
 ```
 
-## Переменные окружения
+## Environment Variables
 
 - `CODEX_BACKEND`: `auto|api|signin` (default `auto`)
-- `OPENAI_API_KEY`: ключ OpenAI (обязателен для `api`)
-- `OPENAI_BASE_URL`: базовый URL OpenAI-compatible API (default `https://api.openai.com/v1`)
-- `OPENAI_MODEL`: модель для API backend (default `gpt-5-codex`)
-- `CODEX_BIN`: путь к `codex` binary (если не найден в `PATH`)
-- `CODEX_SIGNIN_MODEL`: модель для sign-in backend (default `gpt-5-codex`)
-- `PROMPT_DIR`: директория записи `PROMPT.md` (default текущая рабочая директория)
+- `OPENAI_API_KEY`: OpenAI API key (required for `api`)
+- `OPENAI_BASE_URL`: OpenAI-compatible API base URL (default `https://api.openai.com/v1`)
+- `OPENAI_MODEL`: model for API backend (default `gpt-5-codex`)
+- `CODEX_BIN`: path to `codex` binary (if not found in `PATH`)
+- `CODEX_SIGNIN_MODEL`: model for sign-in backend (default `gpt-5-codex`)
+- `PROMPT_DIR`: output directory for `PROMPT.md` (default: current working directory)
 
-## Разработка и тесты
+## Development and Tests
 
 ```powershell
 go test ./gomcp-bridge/...
 ```
 
-## Ограничения и поведение
+## Constraints and Behavior
 
-- `ask_codex` работает как одна непрерывная сессия до следующего `generate_prompt_md`.
-- `fill_md_files` принимает только JSON-ответ и пишет только файлы из разрешенного списка `targets`.
-- При backend `signin` требуется авторизация Codex CLI (`codex login`).
-
+- `ask_codex` works as one continuous session until the next `generate_prompt_md`.
+- `fill_md_files` accepts only JSON output and writes only files from the allowed `targets` list.
+- The `signin` backend requires Codex CLI authentication (`codex login`).
